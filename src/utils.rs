@@ -20,7 +20,9 @@ fn finalize_url(path: &str, query: BTreeMap<String, String>) -> String {
             if let Ok(secret) = secret {
                 let set = query
                     .iter()
-                    .filter(|(key, _)| !matches!(key.as_str(), "qhash" | "range" | "rewrite"))
+                    .filter(|(key, _)| {
+                        !matches!(key.as_str(), "qhash" | "range" | "rewrite" | "rn")
+                    })
                     .map(|(key, value)| (key.as_bytes().to_owned(), value.as_bytes().to_owned()))
                     .collect::<BTreeSet<_>>();
 

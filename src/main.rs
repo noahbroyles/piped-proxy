@@ -1,3 +1,4 @@
+mod sabr;
 mod ump_stream;
 mod utils;
 
@@ -143,6 +144,14 @@ const ALLOWED_DOMAINS: [&str; 8] = [
     "ajay.app",
 ];
 
+/// Whether the proxy may fetch from `host` (one of the allowed domains or a subdomain of one).
+fn is_host_allowed(host: &str) -> bool {
+    RE_DOMAIN
+        .captures(host)
+        .and_then(|domain| domain.get(1))
+        .is_some_and(|domain| ALLOWED_DOMAINS.contains(&domain.as_str()))
+}
+
 fn add_headers(response: &mut HttpResponseBuilder) {
     response
         .append_header(("Access-Control-Allow-Origin", "*"))
@@ -273,13 +282,18 @@ fn apply_range_headers(response: &mut HttpResponseBuilder, range_request: &Range
     response.insert_header(("Content-Length", actual_length.to_string()));
 }
 
-async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
+async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<dyn Error>> {
+    // SABR clients POST their requests to /videoplayback, nothing else takes a body
+    let is_sabr_post =
+        req.method() == actix_web::http::Method::POST && req.path() == "/videoplayback";
+
     if req.method() == actix_web::http::Method::OPTIONS {
         let mut response = HttpResponse::Ok();
         add_headers(&mut response);
         return Ok(response.finish());
     } else if req.method() != actix_web::http::Method::GET
         && req.method() != actix_web::http::Method::HEAD
+        && !is_sabr_post
     {
         let mut response = HttpResponse::MethodNotAllowed();
         add_headers(&mut response);
@@ -310,7 +324,7 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
             {
                 let pairs = query.to_pairs();
                 for (key, value) in &pairs {
-                    if matches!(*key, "qhash" | "range" | "rewrite") {
+                    if matches!(*key, "qhash" | "range" | "rewrite" | "rn") {
                         continue;
                     }
                     set.insert((key.as_bytes().to_owned(), value.as_bytes().to_owned()));
@@ -367,14 +381,11 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
     #[cfg(feature = "avif")]
     let avif = query.get("avif") == Some("true");
 
-    let Some(domain) = RE_DOMAIN
-        .captures(host.as_str())
-        .map(|domain| domain.get(1).unwrap().as_str())
-    else {
+    if !RE_DOMAIN.is_match(host.as_str()) {
         return Err("Invalid host provided".into());
-    };
+    }
 
-    if !ALLOWED_DOMAINS.contains(&domain) {
+    if !is_host_allowed(host.as_str()) {
         return Err("Domain not allowed".into());
     }
 
@@ -395,6 +406,11 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
     }
 
     let is_android = video_playback && query.get("c").unwrap_or("").eq("ANDROID");
+
+    if is_sabr_post {
+        return proxy_sabr(&req, query, &host, body, is_android).await;
+    }
+
     let is_web = video_playback && query.get("c").unwrap_or("").eq("WEB");
 
     let is_ump = video_playback && query.get("ump").is_some();
@@ -661,4 +677,77 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
 
     // Stream response
     Ok(response.streaming(resp.bytes_stream()))
+}
+
+/// Forwards a SABR (or plain UMP) POST from a client that speaks the protocol itself,
+/// such as googlevideo's `SabrStreamingAdapter`. The body goes up as-is and the UMP
+/// response comes back as-is, except that redirects are pointed back at this proxy.
+async fn proxy_sabr(
+    req: &HttpRequest,
+    query: QString,
+    host: &str,
+    body: web::Bytes,
+    is_android: bool,
+) -> Result<HttpResponse, Box<dyn Error>> {
+    let qs = QString::new(
+        query
+            .into_pairs()
+            .into_iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "host" | "rewrite" | "qhash"))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut url = Url::parse(&format!("https://{}{}", host, req.path()))?;
+    url.set_query(Some(qs.to_string().as_str()));
+
+    let mut request = Request::new(Method::POST, url);
+    request.body_mut().replace(Body::from(body));
+
+    let request_headers = request.headers_mut();
+    for (key, value) in req.headers() {
+        let key = key.as_str();
+        // Leave compression to reqwest, which then hands us decoded bytes the redirect rewriter can read
+        if is_header_allowed(key) && key != "accept-encoding" {
+            request_headers.insert(
+                HeaderName::from_str(key)?,
+                HeaderValue::from_bytes(value.as_bytes())?,
+            );
+        }
+    }
+
+    if is_android {
+        request_headers.insert("User-Agent", ANDROID_USER_AGENT.parse()?);
+    }
+
+    let resp = CLIENT.execute(request).await?;
+
+    let mut response = HttpResponse::build(StatusCode::from_u16(resp.status().as_u16())?);
+    add_headers(&mut response);
+
+    for (key, value) in resp.headers() {
+        if is_header_allowed(key.as_str()) {
+            response.append_header((key.as_str(), value.as_bytes()));
+        }
+    }
+
+    let is_ump = resp
+        .headers()
+        .get("content-type")
+        .is_some_and(|content_type| {
+            content_type
+                .as_bytes()
+                .starts_with(b"application/vnd.yt-ump")
+        });
+
+    let stream = resp.bytes_stream().map_err(io::Error::other);
+
+    if is_ump {
+        if let Some(origin) = sabr::public_origin(req) {
+            // The rewritten redirects change the length, so this is always chunked
+            return Ok(response.streaming(sabr::UmpRedirectRewriter::new(stream, origin)));
+        }
+        eprintln!("Cannot work out this proxy's public URL, so SABR redirects will bypass it. Set PROXY_PUBLIC_URL.");
+    }
+
+    Ok(response.streaming(stream))
 }
