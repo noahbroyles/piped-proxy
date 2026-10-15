@@ -1,3 +1,4 @@
+mod sabr;
 mod ump_stream;
 mod utils;
 
@@ -143,6 +144,19 @@ const ALLOWED_DOMAINS: [&str; 8] = [
     "ajay.app",
 ];
 
+/// Whether `host` is googlevideo.com or a subdomain of it, the only hosts that serve SABR.
+fn is_googlevideo_host(host: &str) -> bool {
+    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
+}
+
+/// Whether the proxy may fetch from `host` (one of the allowed domains or a subdomain of one).
+fn is_host_allowed(host: &str) -> bool {
+    RE_DOMAIN
+        .captures(host)
+        .and_then(|domain| domain.get(1))
+        .is_some_and(|domain| ALLOWED_DOMAINS.contains(&domain.as_str()))
+}
+
 fn add_headers(response: &mut HttpResponseBuilder) {
     response
         .append_header(("Access-Control-Allow-Origin", "*"))
@@ -169,11 +183,39 @@ fn is_header_allowed(header: &str) -> bool {
             | "range"
             | "transfer-encoding"
             | "x-real-ip"
+            // Anything that could carry the viewer's IP address or the instance's own credentials.
+            // Reverse proxies in front of this one (or the viewer) may set these.
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-forwarded-port"
+            | "forwarded"
+            | "via"
+            | "cf-connecting-ip"
+            | "true-client-ip"
+            | "x-client-ip"
+            | "cookie"
+            | "authorization"
+            | "proxy-authorization"
             | "origin"
             | "referer"
             // the 'x-title' header contains non-ascii characters which is not allowed on some HTTP clients
             | "x-title"
     )
+}
+
+/// Parses "start-end" or "start-" (optionally prefixed with "bytes="), as used by the Range header
+/// and the range query parameter. Returns None for anything else instead of panicking.
+fn parse_byte_range(range: &str) -> Option<(u64, Option<u64>)> {
+    let range = range.trim();
+    let range = range.strip_prefix("bytes=").unwrap_or(range);
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = match end.trim() {
+        "" => None,
+        end => Some(end.parse::<u64>().ok()?),
+    };
+    Some((start, end))
 }
 
 struct RangeRequest {
@@ -273,13 +315,18 @@ fn apply_range_headers(response: &mut HttpResponseBuilder, range_request: &Range
     response.insert_header(("Content-Length", actual_length.to_string()));
 }
 
-async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
+async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<dyn Error>> {
+    // SABR clients POST their requests to /videoplayback, nothing else takes a body
+    let is_sabr_post =
+        req.method() == actix_web::http::Method::POST && req.path() == "/videoplayback";
+
     if req.method() == actix_web::http::Method::OPTIONS {
         let mut response = HttpResponse::Ok();
         add_headers(&mut response);
         return Ok(response.finish());
     } else if req.method() != actix_web::http::Method::GET
         && req.method() != actix_web::http::Method::HEAD
+        && !is_sabr_post
     {
         let mut response = HttpResponse::MethodNotAllowed();
         add_headers(&mut response);
@@ -310,7 +357,7 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
             {
                 let pairs = query.to_pairs();
                 for (key, value) in &pairs {
-                    if matches!(*key, "qhash" | "range" | "rewrite") {
+                    if matches!(*key, "qhash" | "range" | "rewrite" | "rn") {
                         continue;
                     }
                     set.insert((key.as_bytes().to_owned(), value.as_bytes().to_owned()));
@@ -367,14 +414,11 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
     #[cfg(feature = "avif")]
     let avif = query.get("avif") == Some("true");
 
-    let Some(domain) = RE_DOMAIN
-        .captures(host.as_str())
-        .map(|domain| domain.get(1).unwrap().as_str())
-    else {
+    if !RE_DOMAIN.is_match(host.as_str()) {
         return Err("Invalid host provided".into());
-    };
+    }
 
-    if !ALLOWED_DOMAINS.contains(&domain) {
+    if !is_host_allowed(host.as_str()) {
         return Err("Domain not allowed".into());
     }
 
@@ -395,35 +439,36 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
     }
 
     let is_android = video_playback && query.get("c").unwrap_or("").eq("ANDROID");
+
+    if is_sabr_post {
+        // Only googlevideo speaks SABR; anything else would make this an open POST relay
+        if !is_googlevideo_host(&host) {
+            return Err("Domain not allowed".into());
+        }
+        return proxy_sabr(&req, query, &host, body, is_android).await;
+    }
+
     let is_web = video_playback && query.get("c").unwrap_or("").eq("WEB");
 
     let is_ump = video_playback && query.get("ump").is_some();
 
     let mime_type = query.get("mime").map(|s| s.to_string());
 
+    // A content length of 0 would make every "clen - 1" below underflow, so treat it as unknown
     let clen = query
         .get("clen")
-        .map(|s| s.to_string().parse::<u64>().unwrap());
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&clen| clen > 0);
 
     if video_playback && !query.has("range") {
         if let Some(range) = req.headers().get("range") {
-            let range = range.to_str().unwrap();
-            let range = range.replace("bytes=", "");
-            let range = range.split('-').collect::<Vec<_>>();
-            let start = range[0].parse::<u64>().unwrap();
-            let end = match range[1].parse::<u64>() {
-                Ok(end) => end,
-                Err(_) => {
-                    if let Some(clen) = clen {
-                        clen - 1
-                    } else {
-                        0
-                    }
+            // A Range header we can't make sense of is ignored, like servers do
+            if let Some((start, end)) = range.to_str().ok().and_then(parse_byte_range) {
+                let end = end.or(clen.map(|clen| clen - 1)).unwrap_or(0);
+                if end != 0 {
+                    let range = format!("{}-{}", start, end);
+                    query.add_pair(("range", range));
                 }
-            };
-            if end != 0 {
-                let range = format!("{}-{}", start, end);
-                query.add_pair(("range", range));
             }
         } else if let Some(clen) = clen {
             let range = format!("0-{}", clen - 1);
@@ -497,12 +542,15 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
             if !disallow_image_transcoding
                 && (content_type == "image/webp" || content_type == "image/jpeg" && avif)
             {
-                let resp_bytes = resp.bytes().await.unwrap();
+                let resp_bytes = resp.bytes().await?;
                 let (body, content_type) = spawn_blocking(|| {
                     use ravif::{Encoder, Img};
                     use rgb::FromSlice;
 
-                    let image = image::load_from_memory(&resp_bytes).unwrap();
+                    // Send anything that doesn't decode as it is
+                    let Ok(image) = image::load_from_memory(&resp_bytes) else {
+                        return (resp_bytes.into(), "image/jpeg");
+                    };
 
                     let width = image.width() as usize;
                     let height = image.height() as usize;
@@ -531,17 +579,22 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
 
             #[cfg(feature = "webp")]
             if !disallow_image_transcoding && content_type == "image/jpeg" {
-                let resp_bytes = resp.bytes().await.unwrap();
+                let resp_bytes = resp.bytes().await?;
                 let (body, content_type) = spawn_blocking(|| {
                     use libwebp_sys::{WebPEncodeRGB, WebPFree};
 
-                    let image = image::load_from_memory(&resp_bytes).unwrap();
+                    // Send anything that doesn't decode as it is
+                    let Ok(image) = image::load_from_memory(&resp_bytes) else {
+                        return (resp_bytes.into(), "image/jpeg");
+                    };
                     let width = image.width();
                     let height = image.height();
 
                     let quality = 85;
 
-                    let data = image.as_rgb8().unwrap().as_raw();
+                    // as_rgb8() is None for grayscale or CMYK JPEGs, so convert instead
+                    let image = image.into_rgb8();
+                    let data = image.as_raw();
 
                     let bytes: Vec<u8> = unsafe {
                         let mut out_buf = std::ptr::null_mut();
@@ -574,7 +627,7 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
             if content_type == "application/x-mpegurl"
                 || content_type == "application/vnd.apple.mpegurl"
             {
-                let resp_str = resp.text().await.unwrap();
+                let resp_str = resp.text().await?;
 
                 let modified = resp_str
                     .lines()
@@ -597,7 +650,7 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
                 return Ok(response.body(modified));
             }
             if content_type == "video/vnd.mpeg.dash.mpd" || content_type == "application/dash+xml" {
-                let resp_str = resp.text().await.unwrap();
+                let resp_str = resp.text().await?;
                 let mut new_resp = resp_str.clone();
                 let captures = RE_DASH_MANIFEST.captures_iter(&resp_str);
                 for capture in captures {
@@ -611,8 +664,13 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
         }
     }
 
-    if let Some(content_length) = resp.headers().get("content-length") {
-        response.no_chunking(content_length.to_str().unwrap().parse::<u64>().unwrap());
+    if let Some(content_length) = resp
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        response.no_chunking(content_length);
     }
 
     if is_ump && resp.status().is_success() {
@@ -644,16 +702,17 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
 
         // calculate content length from clen and range
         if let Some(clen) = clen {
-            let length = if let Some(ref range) = range {
-                let range = range.replace("bytes=", "");
-                let range = range.split('-').collect::<Vec<_>>();
-                let start = range[0].parse::<u64>().unwrap();
-                let end = range[1].parse::<u64>().unwrap_or(clen - 1);
-                end - start + 1
-            } else {
-                clen
+            let length = match range.as_deref() {
+                Some(range) => parse_byte_range(range).and_then(|(start, end)| {
+                    let end = end.unwrap_or(clen - 1);
+                    // An inverted range has no sensible length; leave it chunked
+                    end.checked_sub(start).map(|len| len + 1)
+                }),
+                None => Some(clen),
             };
-            response.no_chunking(length);
+            if let Some(length) = length {
+                response.no_chunking(length);
+            }
         }
 
         return Ok(response.streaming(transformed_stream));
@@ -661,4 +720,132 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
 
     // Stream response
     Ok(response.streaming(resp.bytes_stream()))
+}
+
+/// Forwards a SABR (or plain UMP) POST from a client that speaks the protocol itself,
+/// such as googlevideo's `SabrStreamingAdapter`. The body goes up as-is and the UMP
+/// response comes back as-is, except that redirects are pointed back at this proxy.
+async fn proxy_sabr(
+    req: &HttpRequest,
+    query: QString,
+    host: &str,
+    body: web::Bytes,
+    is_android: bool,
+) -> Result<HttpResponse, Box<dyn Error>> {
+    let qs = QString::new(
+        query
+            .into_pairs()
+            .into_iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "host" | "rewrite" | "qhash"))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut url = Url::parse(&format!("https://{}{}", host, req.path()))?;
+    url.set_query(Some(qs.to_string().as_str()));
+
+    let mut request = Request::new(Method::POST, url);
+    request.body_mut().replace(Body::from(body));
+
+    let request_headers = request.headers_mut();
+    for (key, value) in req.headers() {
+        let key = key.as_str();
+        // Leave compression to reqwest, which then hands us decoded bytes the redirect rewriter can read
+        if is_header_allowed(key) && key != "accept-encoding" {
+            request_headers.insert(
+                HeaderName::from_str(key)?,
+                HeaderValue::from_bytes(value.as_bytes())?,
+            );
+        }
+    }
+
+    if is_android {
+        request_headers.insert("User-Agent", ANDROID_USER_AGENT.parse()?);
+    }
+
+    let resp = CLIENT.execute(request).await?;
+
+    let mut response = HttpResponse::build(StatusCode::from_u16(resp.status().as_u16())?);
+    add_headers(&mut response);
+
+    for (key, value) in resp.headers() {
+        if is_header_allowed(key.as_str()) {
+            response.append_header((key.as_str(), value.as_bytes()));
+        }
+    }
+
+    let is_ump = resp
+        .headers()
+        .get("content-type")
+        .is_some_and(|content_type| {
+            content_type
+                .as_bytes()
+                .starts_with(b"application/vnd.yt-ump")
+        });
+
+    let stream = resp.bytes_stream().map_err(io::Error::other);
+
+    if is_ump {
+        if let Some(origin) = sabr::public_origin(req) {
+            // The rewritten redirects change the length, so this is always chunked
+            return Ok(response.streaming(sabr::UmpRedirectRewriter::new(stream, origin)));
+        }
+        eprintln!("Cannot work out this proxy's public URL, so SABR redirects will bypass it. Set PROXY_PUBLIC_URL.");
+    }
+
+    Ok(response.streaming(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_byte_ranges_without_panicking() {
+        assert_eq!(parse_byte_range("bytes=0-499"), Some((0, Some(499))));
+        assert_eq!(parse_byte_range("100-"), Some((100, None)));
+        assert_eq!(parse_byte_range(" bytes=5-10 "), Some((5, Some(10))));
+        for bad in ["", "5", "bytes=5", "a-b", "-5", "5-x", "bytes=-", "1-2-3"] {
+            assert_eq!(parse_byte_range(bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn never_forwards_identifying_headers() {
+        for header in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "x-real-ip",
+            "cookie",
+            "authorization",
+            "proxy-authorization",
+            "origin",
+            "referer",
+        ] {
+            assert!(!is_header_allowed(header), "{} is forwarded", header);
+        }
+        // What SABR and range requests need still goes through
+        for header in ["content-type", "accept", "accept-language"] {
+            assert!(is_header_allowed(header), "{} is dropped", header);
+        }
+    }
+
+    #[test]
+    fn sabr_is_limited_to_googlevideo() {
+        assert!(is_googlevideo_host("rr1---sn-abc.googlevideo.com"));
+        assert!(is_googlevideo_host("googlevideo.com"));
+        for host in [
+            "evilgooglevideo.com",
+            "x.googleusercontent.com",
+            "googlevideo.com.evil.example",
+            "www.youtube.com",
+        ] {
+            assert!(!is_googlevideo_host(host), "{}", host);
+        }
+    }
 }

@@ -4,12 +4,6 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 
-pub fn read_buf(buf: &[u8], pos: &mut usize) -> u8 {
-    let byte = buf[*pos];
-    *pos += 1;
-    byte
-}
-
 fn finalize_url(path: &str, query: BTreeMap<String, String>) -> String {
     #[cfg(feature = "qhash")]
     {
@@ -20,7 +14,9 @@ fn finalize_url(path: &str, query: BTreeMap<String, String>) -> String {
             if let Ok(secret) = secret {
                 let set = query
                     .iter()
-                    .filter(|(key, _)| !matches!(key.as_str(), "qhash" | "range" | "rewrite"))
+                    .filter(|(key, _)| {
+                        !matches!(key.as_str(), "qhash" | "range" | "rewrite" | "rn")
+                    })
                     .map(|(key, value)| (key.as_bytes().to_owned(), value.as_bytes().to_owned()))
                     .collect::<BTreeSet<_>>();
 

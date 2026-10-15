@@ -1,4 +1,3 @@
-use crate::utils;
 use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
 use std::io;
@@ -6,52 +5,11 @@ use std::io::ErrorKind;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-fn read_variable_integer(buf: &[u8], offset: usize) -> io::Result<(i32, usize)> {
-    let mut pos = offset;
-    let prefix = utils::read_buf(buf, &mut pos);
-    let mut size = 0;
-    for shift in 1..=5 {
-        if prefix & (128 >> (shift - 1)) == 0 {
-            size = shift;
-            break;
-        }
-    }
-    if !(1..=5).contains(&size) {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("Invalid integer size {} at position {}", size, offset),
-        ));
-    }
-
-    match size {
-        1 => Ok((prefix as i32, size)),
-        2 => {
-            let value = ((utils::read_buf(buf, &mut pos) as i32) << 6) | (prefix as i32 & 0b111111);
-            Ok((value, size))
-        }
-        3 => {
-            let value = (((utils::read_buf(buf, &mut pos) as i32)
-                | ((utils::read_buf(buf, &mut pos) as i32) << 8))
-                << 5)
-                | (prefix as i32 & 0b11111);
-            Ok((value, size))
-        }
-        4 => {
-            let value = (((utils::read_buf(buf, &mut pos) as i32)
-                | ((utils::read_buf(buf, &mut pos) as i32) << 8)
-                | ((utils::read_buf(buf, &mut pos) as i32) << 16))
-                << 4)
-                | (prefix as i32 & 0b1111);
-            Ok((value, size))
-        }
-        _ => {
-            let value = (utils::read_buf(buf, &mut pos) as i32)
-                | ((utils::read_buf(buf, &mut pos) as i32) << 8)
-                | ((utils::read_buf(buf, &mut pos) as i32) << 16)
-                | ((utils::read_buf(buf, &mut pos) as i32) << 24);
-            Ok((value, size))
-        }
-    }
+/// Reads a UMP variable-length integer at `offset`, or fails if the buffer doesn't hold all of it yet.
+fn read_variable_integer(buf: &[u8], offset: usize) -> io::Result<(u32, usize)> {
+    buf.get(offset..)
+        .and_then(crate::sabr::read_ump_varint)
+        .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "Incomplete UMP integer"))
 }
 
 pub struct UmpTransformStream<S>
@@ -131,8 +89,13 @@ where
                     let _ = this.buffer.split_to(s1 + s2 + segment_length as usize);
                 }
             } else {
-                this.remaining = segment_length as usize - 1;
+                // A zero-length part (no header byte to skip) is not worth underflowing over
+                this.remaining = (segment_length as usize).saturating_sub(1);
 
+                // The header byte after the part header must be here before it can be skipped
+                if this.buffer.len() < s1 + s2 + 1 {
+                    return Poll::Pending;
+                }
                 let _ = this.buffer.split_to(s1 + s2 + 1);
 
                 if this.buffer.len() > segment_length as usize {
@@ -141,7 +104,7 @@ where
 
                     return Poll::Ready(Some(Ok(this.buffer.split_to(len).into())));
                 } else {
-                    this.remaining -= this.buffer.len();
+                    this.remaining = this.remaining.saturating_sub(this.buffer.len());
                     this.found_stream = true;
 
                     return Poll::Ready(Some(Ok(this.buffer.to_vec().into())));
