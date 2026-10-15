@@ -178,6 +178,20 @@ fn is_header_allowed(header: &str) -> bool {
             | "range"
             | "transfer-encoding"
             | "x-real-ip"
+            // Anything that could carry the viewer's IP address or the instance's own credentials.
+            // Reverse proxies in front of this one (or the viewer) may set these.
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-forwarded-port"
+            | "forwarded"
+            | "via"
+            | "cf-connecting-ip"
+            | "true-client-ip"
+            | "x-client-ip"
+            | "cookie"
+            | "authorization"
+            | "proxy-authorization"
             | "origin"
             | "referer"
             // the 'x-title' header contains non-ascii characters which is not allowed on some HTTP clients
@@ -750,4 +764,35 @@ async fn proxy_sabr(
     }
 
     Ok(response.streaming(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn never_forwards_identifying_headers() {
+        for header in [
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "x-real-ip",
+            "cookie",
+            "authorization",
+            "proxy-authorization",
+            "origin",
+            "referer",
+        ] {
+            assert!(!is_header_allowed(header), "{} is forwarded", header);
+        }
+        // What SABR and range requests need still goes through
+        for header in ["content-type", "accept", "accept-language"] {
+            assert!(is_header_allowed(header), "{} is dropped", header);
+        }
+    }
 }
