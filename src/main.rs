@@ -204,6 +204,20 @@ fn is_header_allowed(header: &str) -> bool {
     )
 }
 
+/// Parses "start-end" or "start-" (optionally prefixed with "bytes="), as used by the Range header
+/// and the range query parameter. Returns None for anything else instead of panicking.
+fn parse_byte_range(range: &str) -> Option<(u64, Option<u64>)> {
+    let range = range.trim();
+    let range = range.strip_prefix("bytes=").unwrap_or(range);
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = match end.trim() {
+        "" => None,
+        end => Some(end.parse::<u64>().ok()?),
+    };
+    Some((start, end))
+}
+
 struct RangeRequest {
     start: u64,
     end: u64,
@@ -440,29 +454,21 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
 
     let mime_type = query.get("mime").map(|s| s.to_string());
 
+    // A content length of 0 would make every "clen - 1" below underflow, so treat it as unknown
     let clen = query
         .get("clen")
-        .map(|s| s.to_string().parse::<u64>().unwrap());
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&clen| clen > 0);
 
     if video_playback && !query.has("range") {
         if let Some(range) = req.headers().get("range") {
-            let range = range.to_str().unwrap();
-            let range = range.replace("bytes=", "");
-            let range = range.split('-').collect::<Vec<_>>();
-            let start = range[0].parse::<u64>().unwrap();
-            let end = match range[1].parse::<u64>() {
-                Ok(end) => end,
-                Err(_) => {
-                    if let Some(clen) = clen {
-                        clen - 1
-                    } else {
-                        0
-                    }
+            // A Range header we can't make sense of is ignored, like servers do
+            if let Some((start, end)) = range.to_str().ok().and_then(parse_byte_range) {
+                let end = end.or(clen.map(|clen| clen - 1)).unwrap_or(0);
+                if end != 0 {
+                    let range = format!("{}-{}", start, end);
+                    query.add_pair(("range", range));
                 }
-            };
-            if end != 0 {
-                let range = format!("{}-{}", start, end);
-                query.add_pair(("range", range));
             }
         } else if let Some(clen) = clen {
             let range = format!("0-{}", clen - 1);
@@ -650,8 +656,13 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
         }
     }
 
-    if let Some(content_length) = resp.headers().get("content-length") {
-        response.no_chunking(content_length.to_str().unwrap().parse::<u64>().unwrap());
+    if let Some(content_length) = resp
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        response.no_chunking(content_length);
     }
 
     if is_ump && resp.status().is_success() {
@@ -683,16 +694,17 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
 
         // calculate content length from clen and range
         if let Some(clen) = clen {
-            let length = if let Some(ref range) = range {
-                let range = range.replace("bytes=", "");
-                let range = range.split('-').collect::<Vec<_>>();
-                let start = range[0].parse::<u64>().unwrap();
-                let end = range[1].parse::<u64>().unwrap_or(clen - 1);
-                end - start + 1
-            } else {
-                clen
+            let length = match range.as_deref() {
+                Some(range) => parse_byte_range(range).and_then(|(start, end)| {
+                    let end = end.unwrap_or(clen - 1);
+                    // An inverted range has no sensible length; leave it chunked
+                    end.checked_sub(start).map(|len| len + 1)
+                }),
+                None => Some(clen),
             };
-            response.no_chunking(length);
+            if let Some(length) = length {
+                response.no_chunking(length);
+            }
         }
 
         return Ok(response.streaming(transformed_stream));
@@ -778,6 +790,16 @@ async fn proxy_sabr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_byte_ranges_without_panicking() {
+        assert_eq!(parse_byte_range("bytes=0-499"), Some((0, Some(499))));
+        assert_eq!(parse_byte_range("100-"), Some((100, None)));
+        assert_eq!(parse_byte_range(" bytes=5-10 "), Some((5, Some(10))));
+        for bad in ["", "5", "bytes=5", "a-b", "-5", "5-x", "bytes=-", "1-2-3"] {
+            assert_eq!(parse_byte_range(bad), None, "{:?}", bad);
+        }
+    }
 
     #[test]
     fn never_forwards_identifying_headers() {
