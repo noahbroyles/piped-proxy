@@ -185,7 +185,11 @@ pub fn public_origin(req: &HttpRequest) -> Option<String> {
 /// URLs for hosts the proxy wouldn't serve are left alone.
 pub fn localize_redirect_url(url: &str, origin: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
-    if parsed.scheme() != "https" || !crate::is_host_allowed(parsed.host_str()?) {
+    let host = parsed.host_str()?;
+    if parsed.scheme() != "https"
+        || !crate::is_host_allowed(host)
+        || !crate::is_googlevideo_host(host)
+    {
         return None;
     }
 
@@ -421,6 +425,17 @@ mod tests {
     #[test]
     fn leaves_foreign_redirects_alone() {
         let message = redirect_message("https://evil.example/videoplayback");
+        let rewritten = rewrite_sabr_redirect(&message, |url| {
+            localize_redirect_url(url, "https://proxy.example")
+        })
+        .unwrap();
+        assert_eq!(rewritten.as_ref(), message.as_slice());
+    }
+
+    #[test]
+    fn only_redirects_to_googlevideo_through_the_proxy() {
+        // Allowed for GET, but not a SABR host
+        let message = redirect_message("https://x.googleusercontent.com/videoplayback?a=b");
         let rewritten = rewrite_sabr_redirect(&message, |url| {
             localize_redirect_url(url, "https://proxy.example")
         })

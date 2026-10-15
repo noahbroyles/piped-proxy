@@ -144,6 +144,11 @@ const ALLOWED_DOMAINS: [&str; 8] = [
     "ajay.app",
 ];
 
+/// Whether `host` is googlevideo.com or a subdomain of it, the only hosts that serve SABR.
+fn is_googlevideo_host(host: &str) -> bool {
+    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
+}
+
 /// Whether the proxy may fetch from `host` (one of the allowed domains or a subdomain of one).
 fn is_host_allowed(host: &str) -> bool {
     RE_DOMAIN
@@ -422,6 +427,10 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
     let is_android = video_playback && query.get("c").unwrap_or("").eq("ANDROID");
 
     if is_sabr_post {
+        // Only googlevideo speaks SABR; anything else would make this an open POST relay
+        if !is_googlevideo_host(&host) {
+            return Err("Domain not allowed".into());
+        }
         return proxy_sabr(&req, query, &host, body, is_android).await;
     }
 
@@ -793,6 +802,20 @@ mod tests {
         // What SABR and range requests need still goes through
         for header in ["content-type", "accept", "accept-language"] {
             assert!(is_header_allowed(header), "{} is dropped", header);
+        }
+    }
+
+    #[test]
+    fn sabr_is_limited_to_googlevideo() {
+        assert!(is_googlevideo_host("rr1---sn-abc.googlevideo.com"));
+        assert!(is_googlevideo_host("googlevideo.com"));
+        for host in [
+            "evilgooglevideo.com",
+            "x.googleusercontent.com",
+            "googlevideo.com.evil.example",
+            "www.youtube.com",
+        ] {
+            assert!(!is_googlevideo_host(host), "{}", host);
         }
     }
 }
