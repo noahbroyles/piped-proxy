@@ -542,12 +542,15 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
             if !disallow_image_transcoding
                 && (content_type == "image/webp" || content_type == "image/jpeg" && avif)
             {
-                let resp_bytes = resp.bytes().await.unwrap();
+                let resp_bytes = resp.bytes().await?;
                 let (body, content_type) = spawn_blocking(|| {
                     use ravif::{Encoder, Img};
                     use rgb::FromSlice;
 
-                    let image = image::load_from_memory(&resp_bytes).unwrap();
+                    // Send anything that doesn't decode as it is
+                    let Ok(image) = image::load_from_memory(&resp_bytes) else {
+                        return (resp_bytes.into(), "image/jpeg");
+                    };
 
                     let width = image.width() as usize;
                     let height = image.height() as usize;
@@ -576,17 +579,22 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
 
             #[cfg(feature = "webp")]
             if !disallow_image_transcoding && content_type == "image/jpeg" {
-                let resp_bytes = resp.bytes().await.unwrap();
+                let resp_bytes = resp.bytes().await?;
                 let (body, content_type) = spawn_blocking(|| {
                     use libwebp_sys::{WebPEncodeRGB, WebPFree};
 
-                    let image = image::load_from_memory(&resp_bytes).unwrap();
+                    // Send anything that doesn't decode as it is
+                    let Ok(image) = image::load_from_memory(&resp_bytes) else {
+                        return (resp_bytes.into(), "image/jpeg");
+                    };
                     let width = image.width();
                     let height = image.height();
 
                     let quality = 85;
 
-                    let data = image.as_rgb8().unwrap().as_raw();
+                    // as_rgb8() is None for grayscale or CMYK JPEGs, so convert instead
+                    let image = image.into_rgb8();
+                    let data = image.as_raw();
 
                     let bytes: Vec<u8> = unsafe {
                         let mut out_buf = std::ptr::null_mut();
@@ -619,7 +627,7 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
             if content_type == "application/x-mpegurl"
                 || content_type == "application/vnd.apple.mpegurl"
             {
-                let resp_str = resp.text().await.unwrap();
+                let resp_str = resp.text().await?;
 
                 let modified = resp_str
                     .lines()
@@ -642,7 +650,7 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
                 return Ok(response.body(modified));
             }
             if content_type == "video/vnd.mpeg.dash.mpd" || content_type == "application/dash+xml" {
-                let resp_str = resp.text().await.unwrap();
+                let resp_str = resp.text().await?;
                 let mut new_resp = resp_str.clone();
                 let captures = RE_DASH_MANIFEST.captures_iter(&resp_str);
                 for capture in captures {

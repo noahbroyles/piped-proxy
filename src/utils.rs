@@ -4,12 +4,6 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::env;
 
-pub fn read_buf(buf: &[u8], pos: &mut usize) -> u8 {
-    let byte = buf[*pos];
-    *pos += 1;
-    byte
-}
-
 fn finalize_url(path: &str, query: BTreeMap<String, String>) -> String {
     #[cfg(feature = "qhash")]
     {

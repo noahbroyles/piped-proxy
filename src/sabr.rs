@@ -25,10 +25,11 @@ const PART_SABR_REDIRECT: u32 = 43;
 const MAX_REDIRECT_PART_SIZE: usize = 64 * 1024;
 
 /// Reads a UMP variable-length integer. Returns `(value, bytes used)`, or `None` if `buf` is too short.
+/// Also used by ump_stream.rs.
 ///
 /// UMP integers are not protobuf varints: the number of leading 1 bits in the
 /// first byte says how many more bytes follow (up to 4).
-fn read_ump_varint(buf: &[u8]) -> Option<(u32, usize)> {
+pub fn read_ump_varint(buf: &[u8]) -> Option<(u32, usize)> {
     let first = *buf.first()?;
     let size = match first {
         0x00..=0x7f => 1,
@@ -441,6 +442,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(rewritten.as_ref(), message.as_slice());
+    }
+
+    #[tokio::test]
+    async fn legacy_ump_stream_survives_truncated_input() {
+        use crate::ump_stream::UmpTransformStream;
+        // Truncated varints, a header with no payload, a zero-length media part and garbage
+        for input in [
+            vec![0xff],
+            vec![0xf0, 0x01],
+            vec![21],
+            vec![21, 0],
+            vec![21, 1],
+            vec![21, 0x80],
+            vec![0x80, 0x80, 0x80],
+            vec![21, 5, 0, 1, 2],
+        ] {
+            for chunk_size in [1, 2, input.len()] {
+                let chunks: Vec<Result<Bytes, io::Error>> = input
+                    .chunks(chunk_size)
+                    .map(|c| Ok(Bytes::copy_from_slice(c)))
+                    .collect();
+                let stream = UmpTransformStream::new(stream::iter(chunks));
+                // Must end (or stall) without panicking; give it a moment either way
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    stream.collect::<Vec<_>>(),
+                )
+                .await;
+            }
+        }
     }
 
     #[test]
