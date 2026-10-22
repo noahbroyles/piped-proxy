@@ -151,7 +151,28 @@ fn add_headers(response: &mut HttpResponseBuilder) {
         .append_header(("Access-Control-Max-Age", "1728000"));
 }
 
-fn is_header_allowed(header: &str) -> bool {
+// Headers from the client that may be forwarded upstream. This is an allowlist rather than a
+// blocklist so that anything identifying the user (client IP headers added by reverse proxies and
+// CDNs, cookies, client hints, accept-language, ...) is dropped by default instead of leaking to
+// Google whenever a new header appears.
+//
+// 'accept-encoding' is deliberately not forwarded: reqwest then advertises only the encodings it
+// can decompress itself (gzip, br). Forwarding the client's value could let Google answer with an
+// encoding reqwest passes through still compressed (e.g. zstd), which breaks the manifest rewriting
+// and image transcoding below.
+// 'range' is not forwarded either, it is moved into the query string for videoplayback.
+fn is_request_header_allowed(header: &str) -> bool {
+    matches!(
+        header,
+        "accept"
+            // conditional requests, so the browser can revalidate cached images
+            | "if-none-match"
+            | "if-modified-since"
+    )
+}
+
+// Headers from the upstream response that may be passed back to the client
+fn is_response_header_allowed(header: &str) -> bool {
     if header.starts_with("access-control") {
         return false;
     }
@@ -463,7 +484,7 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
 
     for (key, value) in req.headers() {
         let key = key.as_str();
-        if is_header_allowed(key) {
+        if is_request_header_allowed(key) {
             request_headers.insert(
                 HeaderName::from_str(key)?,
                 HeaderValue::from_bytes(value.as_bytes())?,
@@ -482,7 +503,7 @@ async fn index(req: HttpRequest) -> Result<HttpResponse, Box<dyn Error>> {
     add_headers(&mut response);
 
     for (key, value) in resp.headers() {
-        if is_header_allowed(key.as_str()) {
+        if is_response_header_allowed(key.as_str()) {
             response.append_header((key.as_str(), value.as_bytes()));
         }
     }
