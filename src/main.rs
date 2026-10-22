@@ -1,3 +1,4 @@
+mod resolver;
 mod ump_stream;
 mod utils;
 
@@ -22,6 +23,7 @@ compile_error!("feature \"reqwest-native-tls\" or \"reqwest-rustls\" must be set
 use futures_util::TryStreamExt;
 use http::{HeaderName, Method};
 use reqwest::header::HeaderValue;
+use reqwest::redirect::Policy;
 #[cfg(any(feature = "webp", feature = "avif", feature = "qhash"))]
 use tokio::task::spawn_blocking;
 use ump_stream::UmpTransformStream;
@@ -102,7 +104,26 @@ static RE_DASH_MANIFEST: Lazy<Regex> =
 
 static CLIENT: Lazy<Client> = Lazy::new(|| {
     let builder = Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0");
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0")
+        // reqwest follows redirects to any http(s) URL by default, so a redirect from an allowed
+        // domain could point the proxy at internal services (e.g. cloud metadata at
+        // 169.254.169.254) and their responses would be returned to the client. Only follow
+        // redirects that stay on allowed domains.
+        .redirect(Policy::custom(|attempt| {
+            // same limit as reqwest's default policy, the first URL is the original request
+            if attempt.previous().len() > 10 {
+                return attempt.error("too many redirects");
+            }
+
+            if is_redirect_allowed(attempt.url()) {
+                attempt.follow()
+            } else {
+                let url = attempt.url().to_string();
+                attempt.error(format!("redirect to disallowed URL {}", url))
+            }
+        }))
+        // refuse to connect allowed domains to loopback, private, link-local, ... addresses
+        .dns_resolver(resolver::PublicOnlyResolver);
 
     let proxy = if let Ok(proxy) = env::var("PROXY") {
         reqwest::Proxy::all(proxy).ok()
@@ -142,6 +163,20 @@ const ALLOWED_DOMAINS: [&str; 8] = [
     "odycdn.com",
     "ajay.app",
 ];
+
+// Whether the host is one of ALLOWED_DOMAINS or a subdomain of one
+fn is_domain_allowed(host: &str) -> bool {
+    RE_DOMAIN
+        .captures(host)
+        .is_some_and(|captures| ALLOWED_DOMAINS.contains(&&captures[1]))
+}
+
+// Whether the upstream client may follow a redirect to this URL. Like the original request it must
+// be https on the default port, and its host must be on an allowed domain. IP literals never pass
+// the domain check.
+fn is_redirect_allowed(url: &Url) -> bool {
+    url.scheme() == "https" && url.port().is_none() && url.host_str().is_some_and(is_domain_allowed)
+}
 
 fn add_headers(response: &mut HttpResponseBuilder) {
     response
