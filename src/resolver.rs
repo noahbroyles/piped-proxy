@@ -27,7 +27,7 @@ impl Resolve for PublicOnlyResolver {
             // port 0 is replaced with the default port of the URL's scheme by reqwest
             let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
 
-            if !crate::is_domain_allowed(&host) {
+            if !crate::is_host_allowed(&host) {
                 return Ok(Box::new(addrs.collect::<Vec<_>>().into_iter()) as Addrs);
             }
 
