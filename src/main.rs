@@ -1,3 +1,4 @@
+mod client_pool;
 mod resolver;
 mod sabr;
 mod ump_stream;
@@ -21,6 +22,7 @@ use std::{env, io};
 #[cfg(not(any(feature = "reqwest-native-tls", feature = "reqwest-rustls")))]
 compile_error!("feature \"reqwest-native-tls\" or \"reqwest-rustls\" must be set for proxy to have TLS support");
 
+use client_pool::ClientPool;
 use futures_util::TryStreamExt;
 use http::{HeaderName, Method};
 use reqwest::header::HeaderValue;
@@ -103,7 +105,11 @@ static RE_MANIFEST: Lazy<Regex> = Lazy::new(|| Regex::new("(?m)URI=\"([^\"]+)\""
 static RE_DASH_MANIFEST: Lazy<Regex> =
     Lazy::new(|| Regex::new("BaseURL>(https://[^<]+)</BaseURL").unwrap());
 
-static CLIENT: Lazy<Client> = Lazy::new(|| {
+// Every upstream request goes through here so that requests beyond what one HTTP/2 connection
+// allows open another connection instead of queueing, see client_pool
+static CLIENTS: Lazy<ClientPool> = Lazy::new(|| ClientPool::new(build_client));
+
+fn build_client() -> Client {
     let builder = Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0")
         // reqwest follows redirects to any http(s) URL by default, so a redirect from an allowed
@@ -124,7 +130,14 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
             }
         }))
         // refuse to connect allowed domains to loopback, private, link-local, ... addresses
-        .dns_resolver(resolver::PublicOnlyResolver);
+        .dns_resolver(resolver::PublicOnlyResolver)
+        // HTTP/2 (negotiated through ALPN) puts up to 100 requests to a googlevideo host on one
+        // connection. A response that a slow or paused client isn't reading keeps up to one stream
+        // window (2 MiB by default) of the connection window, so with hyper's default of 5 MiB
+        // three such responses would stall everyone else on that connection. Lift the connection
+        // window to the maximum so only the per-stream window limits what is buffered, like
+        // separate HTTP/1.1 connections would.
+        .http2_initial_connection_window_size(i32::MAX as u32);
 
     let proxy = if let Ok(proxy) = env::var("PROXY") {
         reqwest::Proxy::all(proxy).ok()
@@ -151,7 +164,7 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
     }
     .build()
     .unwrap()
-});
+}
 
 const ANDROID_USER_AGENT: &str = "com.google.android.youtube/1537338816 (Linux; U; Android 13; en_US; ; Build/TQ2A.230505.002; Cronet/113.0.5672.24)";
 const ALLOWED_DOMAINS: [&str; 8] = [
@@ -557,7 +570,7 @@ async fn index(req: HttpRequest, body: web::Bytes) -> Result<HttpResponse, Box<d
         request_headers.insert("User-Agent", ANDROID_USER_AGENT.parse()?);
     }
 
-    let resp = CLIENT.execute(request).await?;
+    let resp = CLIENTS.execute(request).await?;
 
     let mut response = HttpResponse::build(StatusCode::from_u16(resp.status().as_u16())?);
 
@@ -800,7 +813,7 @@ async fn proxy_sabr(
         request_headers.insert("User-Agent", ANDROID_USER_AGENT.parse()?);
     }
 
-    let resp = CLIENT.execute(request).await?;
+    let resp = CLIENTS.execute(request).await?;
 
     let mut response = HttpResponse::build(StatusCode::from_u16(resp.status().as_u16())?);
     add_headers(&mut response);
